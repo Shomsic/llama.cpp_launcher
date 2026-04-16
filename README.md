@@ -176,6 +176,80 @@ Settings are automatically saved to `settings.json` in the application directory
 - `LLAMA_LAUNCHER_HOME`: Override default settings directory
 - `CUDA_VISIBLE_DEVICES`: Control which GPUs are used (llama.cpp)
 
+## Known Issues & Fixes
+
+### Bugs Found and Fixed (Code Review)
+
+#### 1. **Downloader.py - Early Return in Loop** ✅ FIXED
+**Issue**: The `download()` method had an early `return` statement inside the loop processing multiple files, causing only the first file to be downloaded.
+```python
+# BEFORE (Line 111)
+for filename in files_to_download:
+    try:
+        filepath = hf_hub_download(...)
+        downloaded.append((filename, filepath))
+    except Exception as e:
+        failed.append((filename, str(e)))
+    
+    return downloaded, failed  # ❌ Returns after first file!
+```
+**Fix**: Moved the return statement outside the loop to process all files.
+```python
+# AFTER
+for filename in files_to_download:
+    # ... same code ...
+return downloaded, failed  # ✅ Returns after all files processed
+```
+
+#### 2. **FlagBuilder.py - Undefined Variable `kv_type`** ✅ FIXED
+**Issue**: Variables `kv_type` were used on lines 163 and 187 but never defined, causing `NameError` when accessing `metadata['kv_size_mb'][kv_type]`.
+**Fix**: Added variable definition from config at the beginning of `build()` method:
+```python
+kv_type = f"{config.kv_cache_k_type}_{config.kv_cache_v_type}"
+```
+
+#### 3. **Estimator.py - Duplicate Dictionary Key** ✅ FIXED
+**Issue**: In `get_quant_speed_factor()`, the key `"Q1_0"` appeared twice in the dictionary with different values (1.38 and 2.8), causing the second value to override the first.
+```python
+# BEFORE
+{
+    "Q1_0": 1.38,  # Line 168
+    ...
+    "Q1_0": 2.8,   # Line 174 - ❌ Duplicate key!
+}
+```
+**Fix**: Removed the duplicate `"Q1_0": 2.8` entry, keeping the correct value.
+
+#### 4. **ServerManager.py - Missing State Update in `stop()`** ✅ FIXED
+**Issue**: The `stop()` method did not set `self.running = False`, causing potential race conditions and state inconsistencies after server stop is called.
+```python
+# BEFORE
+def stop(self):
+    with self.lock:
+        if not self.running or not self.process:
+            return False
+        self.stop_event.set()
+        # ... terminate process ...
+        return True  # ❌ self.running is still True!
+```
+**Fix**: Added `self.running = False` after setting stop_event:
+```python
+# AFTER
+self.stop_event.set()
+self.running = False  # ✅ Correctly update state
+```
+
+### Additional Issues Identified
+
+#### 5. **Hardware Detection - Unicode Strings**
+⚠️ **Note**: Various functions in `hardware.py` use Russian Cyrillic strings ("Не определена" = "Not determined") for fallback values. While this works on Windows 11 with UTF-8, it may cause issues on older systems or when logging to non-UTF-8 files. Consider using ASCII-only fallback messages for better compatibility.
+
+#### 6. **GGUF Metadata Missing Fields**
+⚠️ **Potential Issue**: The `flag_builder.py` accesses metadata keys like `metadata['is_moe']`, `metadata['kv_size_mb']`, `metadata['has_fused']`, and `metadata['has_ssm']` without checking if they exist. If the `_parse_gguf()` method doesn't return these keys, KeyError will occur. Recommend adding defensive checks:
+```python
+if metadata.get('is_moe'):  # Instead of metadata['is_moe']
+```
+
 ## Troubleshooting
 
 ### GPU Not Detected
@@ -272,5 +346,59 @@ For issues, feature requests, or questions:
 - Attach relevant logs from the `logs/` directory
 
 ---
+
+## Code Quality & Maintenance
+
+### Recent Improvements
+- ✅ Fixed critical bug in batch file downloads (downloader.py)
+- ✅ Resolved undefined variable issues (flag_builder.py)
+- ✅ Removed duplicate dictionary keys (estimator.py)
+- ✅ Fixed thread state management (server_manager.py)
+
+### Recommended Improvements for Future Development
+
+1. **Type Safety**
+   - Add type hints to all function parameters
+   - Use `typing.TypedDict` for complex dictionary structures
+   - Consider using Pydantic for data validation
+
+2. **Error Handling**
+   - Add `.get()` method with defaults when accessing metadata dictionaries
+   - Implement proper logging with Python's `logging` module
+   - Add validation for config values before use
+
+3. **Testing**
+   - Add unit tests for `estimator.py` calculations
+   - Test GPU detection on various hardware configurations
+   - Mock `subprocess` calls in server_manager tests
+
+4. **Code Organization**
+   - Extract metadata dictionary access patterns into helper methods
+   - Consider using a configuration class instead of dictionaries
+   - Separate UI logic from business logic more cleanly
+
+5. **Unicode Compatibility**
+   - Replace Cyrillic fallback strings with ASCII equivalents
+   - Ensure all file operations explicitly use UTF-8 encoding
+   - Test on Windows 7/8 systems
+
+### Code Statistics
+- **Total Files**: ~25 Python modules
+- **Core Modules**: ~8 (hardware, gguf_parser, estimator, server_manager, etc.)
+- **UI Modules**: ~8 (app, components, tabs)
+- **Lines of Code**: ~4000+ (excluding comments)
+- **Languages**: Python 3.10+, Tkinter (UI)
+
+## Contributing
+
+Found a bug or want to improve this project? Consider:
+1. Checking existing issues first
+2. Writing a clear bug report with reproduction steps
+3. Testing fixes on your hardware configuration
+4. Following the existing code style
+
+## License
+
+This project is provided as-is for educational and personal use.
 
 **Created with ❤️ for the open-source LLM community**

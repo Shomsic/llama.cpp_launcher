@@ -4,6 +4,7 @@ import socket
 import os
 import shlex
 import re
+import time
 from core.i18n import _
 
 # Pre-compiled ANSI escape code pattern for stripping color codes from server output
@@ -17,8 +18,10 @@ class LlamaServerManager:
         self.lock = threading.Lock()
         self.on_log = None
         self.on_stop = None
+        self.fallback_args = None
+        self.has_fallen_back = False
 
-    def start(self, cmd_args, cwd=None, on_log=None, on_stop=None):
+    def start(self, cmd_args, cwd=None, on_log=None, on_stop=None, fallback_args=None):
         with self.lock:
             if self.running:
                 return False, _("already_running")
@@ -26,6 +29,8 @@ class LlamaServerManager:
             self.on_log = on_log
             self.on_stop = on_stop
             self.stop_event.clear()
+            self.fallback_args = fallback_args
+            self.has_fallen_back = False
 
             try:
                 # В Windows прячем окно консоли
@@ -66,14 +71,37 @@ class LlamaServerManager:
                 # Чистим ANSI-коды цветов
                 clean_line = _ANSI_ESCAPE_RE.sub('', line).rstrip()
 
-                if clean_line and self.on_log:
-                    self.on_log(clean_line)
+                if clean_line:
+                    # Detect failure for fallback
+                    if not self.has_fallen_back and self.fallback_args:
+                        if any(err in clean_line.lower() for err in ["unsupported architecture", "failed to load model", "error loading model"]):
+                            if self.on_log:
+                                self.on_log(_("detected_failure_falling_back").format(clean_line))
+                            
+                            # Trigger fallback
+                            self.stop()
+                            # Start with fallback args
+                            # Note: we need to be careful about the lock here. stop() acquires it.
+                            # We use a separate thread to restart to avoid deadlocks in _log_reader
+                            threading.Thread(target=self._do_fallback, daemon=True).start()
+                            break
+
+                    if self.on_log:
+                        self.on_log(clean_line)
 
         except Exception as e:
             if self.on_log:
                 self.on_log(_("log_read_error").format(e))
         finally:
             self._cleanup_process()
+
+    def _do_fallback(self):
+        self.has_fallen_back = True
+        # Small delay to ensure stop() finished
+        time.sleep(1)
+        if self.fallback_args:
+            # Re-start with fallback args, using the same callbacks
+            self.start(self.fallback_args, on_log=self.on_log, on_stop=self.on_stop)
 
     def _cleanup_process(self):
         """Гарантированная очистка процесса."""
@@ -111,6 +139,7 @@ class LlamaServerManager:
                 return False
 
             self.stop_event.set()
+            self.running = False
             try:
                 self.process.terminate()
                 # Даем время на мягкое закрытие

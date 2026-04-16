@@ -25,7 +25,6 @@ from core.estimator import (
 )
 from core.i18n import _
 
-
 class AppState:
     """Единый объект состояния, доступный всем частям приложения."""
 
@@ -94,7 +93,7 @@ class AppState:
         self.ctx_var = tk.IntVar(value=s.get("ctx", 4096))
         self.threads_var = tk.IntVar(value=s.get("threads", min(4, cpu_cores)))
         self.gpu_offload_pct_var = tk.IntVar(value=s.get("gpu_offload_pct", 100))
-
+        
         # --- Параметры генерации ---
         self.temp_var = tk.DoubleVar(value=s.get("temp", 0.8))
         self.top_k_var = tk.IntVar(value=s.get("top_k", 40))
@@ -115,11 +114,16 @@ class AppState:
         self.mmap_var = tk.StringVar(value=s.get("mmap", "on"))
         self.mlock_var = tk.StringVar(value=s.get("mlock", "off"))
         self.kv_offload_var = tk.StringVar(value=s.get("kv_offload", "on"))
+        self.kv_cache_k_type_var = tk.StringVar(value=s.get("kv_cache_k_type", "q4_0"))
+        self.kv_cache_v_type_var = tk.StringVar(value=s.get("kv_cache_v_type", "q4_0"))
         self.cache_prompt_var = tk.StringVar(value=s.get("cache_prompt", "on"))
         self.rope_scale_var = tk.StringVar(value=s.get("rope_scale", "auto"))
         self.rope_freq_base_var = tk.StringVar(value=s.get("rope_freq_base", "auto"))
         self.api_key_var = tk.StringVar(value=s.get("api_key", ""))
         self.webui_var = tk.StringVar(value=s.get("webui", "on"))
+        self.backend_var = tk.StringVar(value=s.get("backend", "auto"))
+        self.mmproj_var = tk.StringVar(value=s.get("mmproj", ""))
+        self.keep_alive_var = tk.BooleanVar(value=s.get("keep_alive", False))
         self.custom_args_var = tk.StringVar(value=s.get("custom_args", ""))
         self.language_var = tk.StringVar(value=s.get("language", "ru"))
 
@@ -130,7 +134,7 @@ class AppState:
         self.bench_prompt_var = tk.IntVar(value=s.get("bench_prompt", 512))
         self.bench_predict_var = tk.IntVar(value=s.get("bench_predict", 128))
         self.bench_threads_var = tk.IntVar(value=s.get("bench_threads", 8))
-        self.bench_ngl_var = tk.IntVar(value=s.get("bench_ngl", 999))
+        self.bench_ngl_var = tk.IntVar(value=s.get("bench_ngl", 0))
 
     # ──────────────────────── Listeners ────────────────────────
 
@@ -164,6 +168,7 @@ class AppState:
                             self.settings[k] = v
                     if "custom_presets" in self.settings:
                         for name, preset in self.settings["custom_presets"].items():
+                            from core.config import PRESETS
                             PRESETS[name] = preset
         except Exception as e:
             print(f"Ошибка загрузки настроек: {e}")
@@ -176,6 +181,9 @@ class AppState:
             self.settings["port"] = self.port_var.get()
             self.settings["api_key"] = self.api_key_var.get()
             self.settings["webui"] = self.webui_var.get()
+            self.settings["backend"] = self.backend_var.get()
+            self.settings["mmproj"] = self.mmproj_var.get()
+            self.settings["keep_alive"] = self.keep_alive_var.get()
             self.settings["reasoning"] = self.reasoning_var.get()
             self.settings["cache_prompt"] = self.cache_prompt_var.get()
             self.settings["ngl"] = self.ngl_var.get()
@@ -198,6 +206,8 @@ class AppState:
             self.settings["mmap"] = self.mmap_var.get()
             self.settings["mlock"] = self.mlock_var.get()
             self.settings["kv_offload"] = self.kv_offload_var.get()
+            self.settings["kv_cache_k_type"] = self.kv_cache_k_type_var.get()
+            self.settings["kv_cache_v_type"] = self.kv_cache_v_type_var.get()
             self.settings["rope_scale"] = self.rope_scale_var.get()
             self.settings["rope_freq_base"] = self.rope_freq_base_var.get()
             self.settings["custom_args"] = self.custom_args_var.get()
@@ -238,6 +248,57 @@ class AppState:
     def get_cpu_cores() -> int:
         return get_cpu_cores()
 
+    def get_preset_list(self) -> list[str]:
+        """Возвращает полный список имен пресетов (стандартные + пользовательские)."""
+        from core.config import PRESETS
+        names = ["— Пользовательские —"] + list(PRESETS.keys())
+        custom = self.settings.get("custom_presets", {})
+        names.extend(custom.keys())
+        return sorted(list(set(names)))
+
+    def delete_preset(self, name: str):
+        """Удаляет пользовательский пресет."""
+        custom = self.settings.get("custom_presets", {})
+        if name in custom:
+            del custom[name]
+            self.save_settings()
+            return True
+        return False
+
+    def rename_preset(self, old_name: str, new_name: str):
+        """Переименовывает пользовательский пресет."""
+        custom = self.settings.get("custom_presets", {})
+        if old_name in custom:
+            custom[new_name] = custom.pop(old_name)
+            self.save_settings()
+            return True
+        return False
+
+    def edit_preset(self, name: str, data: dict):
+        """Редактирует данные пользовательского пресета."""
+        custom = self.settings.get("custom_presets", {})
+        if name in custom:
+            custom[name].update(data)
+            self.save_settings()
+            return True
+        return False
+
+    def add_preset_from_clipboard(self, text: str, name: str) -> bool:
+        """Добавляет пресет из строки (JSON) с заданным именем."""
+        try:
+            import json
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                return False
+            
+            custom = self.settings.setdefault("custom_presets", {})
+            custom[name] = data
+            self.save_settings()
+            return True
+        except:
+            return False
+
+
     # ──────────────────────── Model helpers ────────────────────────
 
     @staticmethod
@@ -265,7 +326,6 @@ class AppState:
                 value = self.coerce_int_metadata(metadata, key)
                 if value and 5 <= value <= 512:
                     return value
-        # Fallback по имени файла
         name = os.path.basename(model_path).lower()
         for pattern, layers in [('70b', 80), ('34b', 60), ('13b', 40), ('mixtral', 40),
                                  ('3b', 32), ('1b', 24), ('0.5b', 12)]:
@@ -333,6 +393,8 @@ class AppState:
             kv_offload_on=self.kv_offload_var.get() == "on",
             flash_attn_on=self.flash_attn_var.get() in ("on", "auto"),
             batch_size=self.batch_size_var.get(),
+            kv_cache_k_type=self.kv_cache_k_type_var.get(),
+            kv_cache_v_type=self.kv_cache_v_type_var.get(),
             get_model_info=self.get_model_info,
             get_gpu_info=self.get_gpu_info,
             get_cached_metadata=self.gguf_parser.get_cached_or_parse,
@@ -362,8 +424,13 @@ class AppState:
         path = self.llama_dir_var.get()
         if not path:
             return None
-        for exe in ("llama-server.exe", "llama-cli.exe"):
-            full = os.path.join(path, exe)
+        bin_name = "llama-server.exe" if os.name == 'nt' else "llama-server"
+        candidates = [
+            os.path.join(path, bin_name),
+            os.path.join(path, "bin", bin_name),
+            os.path.join(path, "build", "bin", bin_name),
+        ]
+        for full in candidates:
             if os.path.exists(full):
                 return full
         return None
@@ -389,10 +456,8 @@ class AppState:
             status = _("cli_found")
         else:
             return False, _("binaries_not_found")
-        
         if os.path.exists(os.path.join(path, "llama-bench.exe")):
             status += " + llama-bench"
-            
         return True, status
 
     # ──────────────────────── Models list ────────────────────────
@@ -510,6 +575,5 @@ class AppState:
         if not model_path:
             self.draft_model_name_var.set(_("no_model"))
             return
-
         model_name = os.path.basename(model_path)
         self.draft_model_name_var.set(f"Draft: {model_name}")

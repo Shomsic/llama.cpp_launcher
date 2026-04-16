@@ -1,9 +1,10 @@
 """Панели параметров: Basic, Generation, Advanced и Presets."""
 import tkinter as tk
-from tkinter import ttk, simpledialog, W, E, X, LEFT
+from tkinter import ttk, simpledialog, messagebox, W, E, X, LEFT
 
 from core.config import PRESETS
 from core.i18n import _
+from ui.components.collapsible_frame import CollapsibleFrame
 
 
 class PresetPanel:
@@ -12,36 +13,54 @@ class PresetPanel:
     def __init__(self, parent, state, toast):
         self.state = state
         self.toast = toast
-
+        self.combo = None # Store reference for updating
+        
         section = ttk.LabelFrame(parent, text=" " + _("presets") + " ", padding=10)
         section.pack(fill=X, pady=(0, 10))
-
+        
         row = ttk.Frame(section)
         row.pack(fill=X)
-
+        
         ttk.Label(row, text=_("select_preset")).pack(side=LEFT, padx=(0, 5))
-
-        preset_names = list(PRESETS.keys())
+        
+        self._refresh_combo_values()
         self.combo = ttk.Combobox(
             row, textvariable=state.preset_var,
-            values=["— Пользовательские —"] + preset_names,
+            values=self.state.get_preset_list(),
             state="readonly", width=25
         )
         self.combo.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
         self.combo.bind("<<ComboboxSelected>>", self._apply_preset)
-
-        ttk.Button(row, text=_("btn_save"), command=self._save_custom, width=12).pack(side=LEFT)
-
+        
+        # Buttons
+        btn_frame = ttk.Frame(row)
+        btn_frame.pack(side=LEFT)
+        
+        ttk.Button(btn_frame, text=_("btn_save"), command=self._save_custom, width=8).pack(side=LEFT, padx=2)
+        ttk.Button(btn_frame, text="✎", command=self._rename_preset, width=3).pack(side=LEFT, padx=2)
+        ttk.Button(btn_frame, text="⚙", command=self._edit_preset, width=3).pack(side=LEFT, padx=2)
+        ttk.Button(btn_frame, text="🗑", command=self._delete_preset, width=3).pack(side=LEFT, padx=2)
+        ttk.Button(btn_frame, text="📋", command=self._import_preset, width=3).pack(side=LEFT, padx=2)
+        
         self.desc_label = ttk.Label(section, text="", font=("Segoe UI", 8),
-                                    foreground="#90caf9", wraplength=400)
+                                     foreground="#90caf9", wraplength=400)
         self.desc_label.pack(fill=X, pady=(5, 0))
 
     def _apply_preset(self, _event=None):
         selected = self.state.preset_var.get()
-        if selected not in PRESETS:
+        preset = None
+        
+        # Try standard presets
+        if selected in PRESETS:
+            preset = PRESETS[selected]
+        # Try custom presets from settings
+        elif selected in self.state.settings.get("custom_presets", {}):
+            preset = self.state.settings["custom_presets"][selected]
+            
+        if not preset:
             self.desc_label.config(text="")
             return
-        preset = PRESETS[selected]
+            
         var_map = {
             'ctx': 'ctx_var', 'temp': 'temp_var', 'top_k': 'top_k_var',
             'top_p': 'top_p_var', 'min_p': 'min_p_var',
@@ -58,10 +77,13 @@ class PresetPanel:
         self.desc_label.config(text=" | ".join(desc))
         self.state.notify_update()
 
+    def _refresh_combo_values(self):
+        """Обновляет список пресетов в выпадающем списке."""
+        vals = self.state.get_preset_list()
+        if self.combo:
+            self.combo.config(values=vals)
+
     def _save_custom(self):
-        name = simpledialog.askstring(_("btn_save"), _("select_preset")) # Reusing keys if appropriate or I should add specific ones. Let's add specific if needed.
-        # Wait, i18n has "btn_save" as "💾 Сохранить". 
-        # Actually I'll use direct strings for now and fix them in i18n if I missed some.
         name = simpledialog.askstring(_("btn_save"), _("btn_save"))
         if not name:
             return
@@ -76,12 +98,66 @@ class PresetPanel:
             'mirostat': s.mirostat_var.get()
         }
         s.settings.setdefault('custom_presets', {})[name] = preset
-        PRESETS[name] = preset
-        self.combo.config(values=["— Пользовательские —"] + list(PRESETS.keys()))
+        self._refresh_combo_values()
         s.preset_var.set(name)
         s.save_settings()
         self._apply_preset()
         self.toast.show(f"💾 Пресет '{name}' сохранён!")
+
+    def _rename_preset(self):
+        name = self.state.preset_var.get()
+        if name == "— Пользовательские —" or name not in self.state.settings.get("custom_presets", {}):
+            self.toast.show("⚠️ Можно переименовывать только пользовательские пресеты")
+            return
+        
+        new_name = simpledialog.askstring("Переименование", f"Новое имя для '{name}':", initialvalue=name)
+        if not new_name or new_name == name:
+            return
+        
+        if self.state.rename_preset(name, new_name):
+            self._refresh_combo_values()
+            self.state.preset_var.set(new_name)
+            self.toast.show(f"✅ Пресет переименован в '{new_name}'")
+        else:
+            self.toast.show("❌ Ошибка при переименовании")
+
+    def _delete_preset(self):
+        name = self.state.preset_var.get()
+        if name == "— Пользовательские —" or name not in self.state.settings.get("custom_presets", {}):
+            self.toast.show("⚠️ Можно удалять только пользовательские пресеты")
+            return
+        
+        if messagebox.askyesno("Подтверждение", f"Вы уверены, что хотите удалить пресет '{name}'?"):
+            if self.state.delete_preset(name):
+                self._refresh_combo_values()
+                self.state.preset_var.set("— Пользовательские —")
+                self.desc_label.config(text="")
+                self.toast.show(f"🗑 Пресет '{name}' удалён")
+            else:
+                self.toast.show("❌ Ошибка при удалении")
+
+    def _edit_preset(self):
+        name = self.state.preset_var.get()
+        if name == "— Пользовательские —" or name not in self.state.settings.get("custom_presets", {}):
+            self.toast.show("⚠️ Можно редактировать только пользовательские пресеты")
+            return
+        
+        # For editing, we just tell the user to adjust parameters and click "Save"
+        self.toast.show("⚙️ Настройте параметры и нажмите 'Сохранить' для обновления")
+
+    def _import_preset(self):
+        text = self.root.clipboard_get()
+        name = simpledialog.askstring("Импорт", "Введите имя для импортируемого пресета:")
+        if not name:
+            return
+        
+        if self.state.add_preset_from_clipboard(text, name):
+            self._refresh_combo_values()
+            self.state.preset_var.set(name)
+            self._apply_preset()
+            self.toast.show(f"📋 Пресет '{name}' импортирован из буфера")
+        else:
+            self.toast.show("❌ Ошибка импорта: проверьте формат JSON")
 
 
 class BasicParamsPanel:
@@ -91,11 +167,11 @@ class BasicParamsPanel:
         self.state = state
         s = state
 
-        section = ttk.LabelFrame(parent, text=" " + _("basic_params") + " ", padding=10)
+        section = CollapsibleFrame(parent, title=" " + _("basic_params") + " ")
         section.pack(fill=X, pady=(0, 10))
-        grid = ttk.Frame(section)
+        grid = ttk.Frame(section.content)
         grid.pack(fill=X)
-
+        
         # Model info
         self.model_info_label = ttk.Label(grid, text=_("no_model"), font=("Segoe UI", 9))
         self.model_info_label.grid(row=0, column=0, columnspan=4, sticky=W, pady=(0, 5))
@@ -219,9 +295,9 @@ class GenerationParamsPanel:
     """Параметры генерации: temp, top_k/p, min_p, penalties, mirostat, etc."""
 
     def __init__(self, parent, state, tooltip):
-        section = ttk.LabelFrame(parent, text=" " + _("generation_params") + " ", padding=10)
+        section = CollapsibleFrame(parent, title=" " + _("generation_params") + " ")
         section.pack(fill=X, pady=(0, 10))
-        grid = ttk.Frame(section)
+        grid = ttk.Frame(section.content)
         grid.pack(fill=X)
         s = state
 
@@ -268,9 +344,9 @@ class AdvancedParamsPanel:
 
     def __init__(self, parent, state, tooltip):
         self.state = state
-        section = ttk.LabelFrame(parent, text=" " + _("advanced_params") + " ", padding=10)
+        section = CollapsibleFrame(parent, title=" " + _("advanced_params") + " ")
         section.pack(fill=X, pady=(0, 10))
-        grid = ttk.Frame(section)
+        grid = ttk.Frame(section.content)
         grid.pack(fill=X)
         s = state
 
@@ -296,7 +372,9 @@ class AdvancedParamsPanel:
             (2, 2, "mlock:", s.mlock_var, ["on", "off"], "Удерживать модель в RAM"),
             (3, 0, "kv_offload:", s.kv_offload_var, ["on", "off"], "Выгрузка KV кэша в GPU"),
             (3, 2, "cache_prompt:", s.cache_prompt_var, ["on", "off"], "Кэширование промптов"),
-            (5, 2, "Web UI:", s.webui_var, ["on", "off"], "Встроенный чат Web UI"),
+            (4, 0, "KV Cache K:", s.kv_cache_k_type_var, ["f16", "q8_0", "q4_0"], "Квантование K-кэша (f16=2б, q8=1б, q4=0.5б)"),
+            (5, 0, "KV Cache V:", s.kv_cache_v_type_var, ["f16", "q8_0", "q4_0"], "Квантование V-кэша (f16=2б, q8=1б, q4=0.5б)"),
+            (8, 2, "Web UI:", s.webui_var, ["on", "off"], "Встроенный чат Web UI"),
         ]
         for row, col, label_text, var, values, tip in combos:
             lbl = ttk.Label(grid, text=label_text)
@@ -305,39 +383,101 @@ class AdvancedParamsPanel:
             if var and values:
                 cb = ttk.Combobox(grid, textvariable=var, values=values, width=8, state="readonly")
                 cb.grid(row=row, column=col + 1, sticky=W, padx=(0, 15) if col == 0 else 0, pady=3)
-                if var is s.kv_offload_var:
+                if var in (s.kv_offload_var, s.kv_cache_k_type_var, s.kv_cache_v_type_var):
                     cb.bind("<<ComboboxSelected>>", lambda _: s.notify_update())
-
+        
+        # Keep alive checkbox
+        lbl_ka = ttk.Label(grid, text="Keep-alive:")
+        lbl_ka.grid(row=6, column=2, sticky=W, padx=(0, 5), pady=3)
+        tooltip.bind(lbl_ka, "Автоматический перезапуск сервера при сбоях")
+        ttk.Checkbutton(grid, variable=s.keep_alive_var).grid(row=6, column=3, sticky=W, pady=3)
+        
         # Seed spinbox
         lbl = ttk.Label(grid, text="seed:")
         lbl.grid(row=1, column=2, sticky=W, padx=(0, 5), pady=3)
         tooltip.bind(lbl, "Зерно RNG (-1=случайное)")
         ttk.Spinbox(grid, from_=-1, to=2147483647, textvariable=s.seed_var, width=8).grid(
             row=1, column=3, sticky=W, pady=3)
-
-        # Row 4 — rope
+        
+        # Row 7 — rope
         lbl = ttk.Label(grid, text="rope_scale:")
-        lbl.grid(row=4, column=0, sticky=W, padx=(0, 5), pady=3)
+        lbl.grid(row=7, column=0, sticky=W, padx=(0, 5), pady=3)
         tooltip.bind(lbl, "RoPE масштабирование (для экстенсивного контекста)")
         ttk.Entry(grid, textvariable=s.rope_scale_var, width=10).grid(
-            row=4, column=1, sticky=W, padx=(0, 15), pady=3)
-
+            row=7, column=1, sticky=W, padx=(0, 15), pady=3)
+        
         lbl = ttk.Label(grid, text="rope_freq_base:")
-        lbl.grid(row=4, column=2, sticky=W, padx=(0, 5), pady=3)
+        lbl.grid(row=7, column=2, sticky=W, padx=(0, 5), pady=3)
         tooltip.bind(lbl, "RoPE базовая частота")
         ttk.Entry(grid, textvariable=s.rope_freq_base_var, width=10).grid(
-            row=4, column=3, sticky=W, pady=3)
-
-        # Row 5 — API key, webui
+            row=7, column=3, sticky=W, pady=3)
+        
+        # Row 8 — API key, webui
         lbl = ttk.Label(grid, text="API Key:")
-        lbl.grid(row=5, column=0, sticky=W, padx=(0, 5), pady=3)
+        lbl.grid(row=8, column=0, sticky=W, padx=(0, 5), pady=3)
         tooltip.bind(lbl, "API ключ для авторизации (пусто=отключён)")
         ttk.Entry(grid, textvariable=s.api_key_var, width=15).grid(
-            row=5, column=1, sticky=W, padx=(0, 15), pady=3)
-
-        # Row 6 — custom args
+            row=8, column=1, sticky=W, padx=(0, 15), pady=3)
+        
+        # Row 9 — custom args
         lbl = ttk.Label(grid, text=_("custom_args"))
-        lbl.grid(row=6, column=0, columnspan=2, sticky=W, pady=(10, 3))
+        lbl.grid(row=9, column=0, columnspan=2, sticky=W, pady=(10, 3))
         tooltip.bind(lbl, "Свободные аргументы через пробел (напр. --metrics -cb)")
         ttk.Entry(grid, textvariable=s.custom_args_var, width=50).grid(
-            row=6, column=2, columnspan=2, sticky=W, pady=(10, 3))
+            row=9, column=2, columnspan=2, sticky=W, pady=(10, 3))
+        
+        # Row 10 — Vision / mmproj
+        lbl = ttk.Label(grid, text="mmproj (vision):")
+        lbl.grid(row=10, column=0, sticky=W, padx=(0, 5), pady=3)
+        tooltip.bind(lbl, "Путь к мультимодальному проектору (mmproj.gguf)")
+        
+        mmproj_var = getattr(s, 'mmproj_var', tk.StringVar())
+        ttk.Entry(grid, textvariable=mmproj_var, width=30).grid(
+            row=10, column=1, sticky=W, padx=(0, 5), pady=3)
+        
+        btn_auto = ttk.Button(grid, text="Auto", width=5, 
+                                command=lambda: self._auto_mmproj(s, mmproj_var))
+        btn_auto.grid(row=10, column=2, sticky=W, pady=3)
+
+    def _auto_mmproj(self, state, mmproj_var):
+        """Automatically finds and downloads the correct mmproj for the active model."""
+        model_path = state.active_model_var.get().strip()
+        if not model_path:
+            from ui.components import toast
+            state.toast.show("⚠️ Сначала выберите модель")
+            return
+        
+        # Try to infer repo from metadata
+        metadata = state.gguf_parser.get_cached_or_parse(model_path)
+        repo = None
+        if metadata:
+            # This is a heuristic; in a real system we'd store the repo in state
+            # For now, let's try to find a repo pattern in the filename or meta
+            name = os.path.basename(model_path)
+            # Very simple heuristic: if it contains a /, it might be a repo
+            if "/" in name:
+                repo = name.split(".gguf")[0]
+            else:
+                # Try to find a repo in metadata if available
+                repo = metadata.get("general.basename") 
+        
+        if not repo:
+            from tkinter import simpledialog
+            repo = simpledialog.askstring("MMProj", "Введите HuggingFace репозиторий модели (напр. unsloth/Llama-3.2-11B-Vision-GGUF):")
+            if not repo: return
+
+        from core.downloader import GGUFDownloader
+        downloader = GGUFDownloader(state)
+        
+        def worker():
+            state.toast.show(f"🔍 Поиск mmproj в {repo}...")
+            path, err = downloader.download_mmproj(repo, os.path.dirname(model_path))
+            if path:
+                mmproj_var.set(path)
+                state.save_settings()
+                state.root.after(0, lambda: state.toast.show(f"✅ mmproj загружен: {os.path.basename(path)}"))
+            else:
+                state.root.after(0, lambda: state.toast.show(f"❌ Ошибка: {err}"))
+        
+        import threading
+        threading.Thread(target=worker, daemon=True).start()

@@ -92,8 +92,14 @@ class LaunchTab:
         self.app.copy_cmd_btn.pack(side=RIGHT, padx=(5, 0))
         
         self.app.open_logs_btn = ttk.Button(actions_frame, text="📂 Логи",
-                                       command=self.app.open_logs_folder, style="Header.TButton")
+                                        command=self.app.open_logs_folder, style="Header.TButton")
         self.app.open_logs_btn.pack(side=RIGHT, padx=(5, 0))
+
+        self.app.ai_tune_btn = ttk.Button(actions_frame, text="🪄 AI Tune",
+                                           command=self.app.run_ai_tune_ui,
+                                           style="Header.TButton")
+        self.app.ai_tune_btn.pack(side=RIGHT, padx=(5, 0))
+
 
     def _create_llama_dir_section(self, parent):
         section = ttk.LabelFrame(parent, text=" Путь к llama.cpp ", padding=10)
@@ -192,15 +198,21 @@ class LaunchTab:
         frame = ttk.Frame(parent)
         frame.pack(fill=X, padx=15, pady=(10, 15))
         
-        self.app.start_btn = ttk.Button(frame, text="▶ ЗАПУСТИТЬ",
-                                    command=self.app.start_server,
-                                    style="Success.TButton")
+        # Create a container for the main actions to control expansion
+        actions_container = ttk.Frame(frame)
+        actions_container.pack(side=LEFT, fill=X, expand=True)
+        
+        self.app.start_btn = ttk.Button(actions_container, text="▶ ЗАПУСТИТЬ",
+                                      command=self.app.start_server,
+                                      style="Success.TButton")
         self.app.start_btn.pack(side=LEFT, fill=X, expand=True)
         
-        self.app.stop_btn = ttk.Button(frame, text="⏹ ОСТАНОВИТЬ",
-                                   command=self.app.stop_server,
-                                   style="Danger.TButton", state=DISABLED)
+        self.app.stop_btn = ttk.Button(actions_container, text="⏹ ОСТАНОВИТЬ",
+                                     command=self.app.stop_server,
+                                     style="Danger.TButton", state=DISABLED)
         self.app.stop_btn.pack(side=LEFT, fill=X, expand=True, padx=(10, 0))
+
+
 
 
 __all__ = ["LaunchTab"]

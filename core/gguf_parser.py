@@ -238,7 +238,6 @@ def validate_gguf_file(model_path):
     except Exception as e:
         return False, f"Неожиданная ошибка: {e}"
 
-@staticmethod
 def get_quant_from_metadata(metadata):
     """Определяет тип квантизации по метаданным (general.file_type)."""
     ftype = metadata.get("general.file_type")

@@ -4,7 +4,8 @@ import re
 class ProfilingData:
     def __init__(self, model_path, ngl, ctx, total_layers, parallel_slots, threads,
                  kv_offload_on, flash_attn_on, batch_size,
-                 get_model_info, get_gpu_info, get_cached_metadata, extract_quant):
+                 get_model_info, get_gpu_info, get_cached_metadata, extract_quant,
+                 kv_cache_k_type="q4_0", kv_cache_v_type="q4_0"):
         self.model_path = model_path
         self.ngl = ngl
         self.ctx = ctx
@@ -14,6 +15,8 @@ class ProfilingData:
         self.kv_offload_on = kv_offload_on
         self.flash_attn_on = flash_attn_on
         self.batch_size = batch_size
+        self.kv_cache_k_type = kv_cache_k_type
+        self.kv_cache_v_type = kv_cache_v_type
         
         self.get_model_info = get_model_info
         self.get_gpu_info = get_gpu_info
@@ -23,14 +26,19 @@ class ProfilingData:
 def calculate_max_ngl(vram, total_layers, model_gb):
     if vram == 0:
         return 0
-    if model_gb is None or model_gb <= 0:
-        return min(total_layers, int(vram / 1024 / 2))
-
+    
     available_vram = vram / 1024
-    estimated_per_layer = model_gb / max(total_layers, 1)
+    
+    # Baseline reserve: 0.5GB for OS/System, + 0.5GB for basic KV cache
     reserve_gb = 1.0
-    usable_vram = max(available_vram - reserve_gb, 0.5)
-
+    usable_vram = max(available_vram - reserve_gb, 0.1)
+    
+    if model_gb is None or model_gb <= 0:
+        # Fallback: assume roughly 200MB per layer for medium models
+        estimated_per_layer = 0.2
+    else:
+        estimated_per_layer = model_gb / max(total_layers, 1)
+    
     max_layers = int(usable_vram / estimated_per_layer) if estimated_per_layer > 0 else 0
     return max(0, min(max_layers, total_layers))
 
@@ -74,7 +82,12 @@ def estimate_memory_breakdown(p: ProfilingData):
     head_count_kv = head_count_kv or _coerce_int_metadata(metadata, "llama.attention.head_count_kv") or head_count
     
     actual_head_size = key_length or (embedding / max(head_count, 1))
-    bytes_per_token_per_layer = head_count_kv * actual_head_size * 2 * 2
+    
+    type_bytes = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}
+    bytes_k = type_bytes.get(p.kv_cache_k_type, 0.5)
+    bytes_v = type_bytes.get(p.kv_cache_v_type, 0.5)
+    
+    bytes_per_token_per_layer = head_count_kv * actual_head_size * (bytes_k + bytes_v)
     kv_multiplier = 0.7 if p.flash_attn_on else 1.0
     ctx_kv_mb = p.ctx * p.total_layers * bytes_per_token_per_layer / (1024 * 1024) * kv_multiplier * p.parallel_slots
     ctx_state_mb = max(128.0, p.ctx * embedding * 0.0000025)
@@ -156,18 +169,23 @@ def get_quant_speed_factor(model_path, extract_quant):
         "Q2_K": 1.16, "Q3_K_S": 1.1, "Q3_K_M": 1.07, "Q3_K_L": 1.02,
         "Q4_0": 1.0, "Q4_1": 0.98, "Q4_K_S": 1.0, "Q4_K_M": 0.97,
         "Q5_0": 0.9, "Q5_1": 0.88, "Q5_K_S": 0.9, "Q5_K_M": 0.87, "MXFP4": 0.99,
-        "Q6_K": 0.8, "Q8_0": 0.68, "Q8_K": 0.65, "Q1_0": 2.8, "F16": 0.55, "BF16": 0.58, "F32": 0.32
+        "Q6_K": 0.8, "Q8_0": 0.68, "Q8_K": 0.65, "F16": 0.55, "BF16": 0.58, "F32": 0.32
     }.get(quant, 1.0)
 
 def _estimate_decode_tps(params_b, quant_factor, offload_pct, threads, ctx_factor,
                          flash_attn_on, kv_offload_on, vram_total_mb, ctx_load_factor):
     gpu_class = 0
-    if vram_total_mb >= 24000: gpu_class = 175
-    elif vram_total_mb >= 16000: gpu_class = 130
-    elif vram_total_mb >= 12000: gpu_class = 95
-    elif vram_total_mb >= 8000: gpu_class = 70
-    elif vram_total_mb >= 6000: gpu_class = 48
-    elif vram_total_mb > 0: gpu_class = 30
+    if vram_total_mb > 0:
+        # Dynamic GPU class based on VRAM (roughly correlates with memory bandwidth)
+        # 24GB (3090/4090) -> 175, 16GB (4080) -> 130, 12GB (3060/4070) -> 95, etc.
+        if vram_total_mb >= 24000: gpu_class = 175
+        elif vram_total_mb >= 20000: gpu_class = 150
+        elif vram_total_mb >= 16000: gpu_class = 130
+        elif vram_total_mb >= 12000: gpu_class = 95
+        elif vram_total_mb >= 10000: gpu_class = 80
+        elif vram_total_mb >= 8000: gpu_class = 70
+        elif vram_total_mb >= 6000: gpu_class = 48
+        else: gpu_class = 30
 
     small_model_boost = 1.0
     if params_b <= 0.75: small_model_boost = 2.2  # Повышено для соответствия реальности на 0.6B моделях

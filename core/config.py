@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
     "port": 8080,
     "api_key": "",
     "webui": "on",
+    "backend": "auto",
     "reasoning": "auto",
     "cache_prompt": "on",
     "ngl": 0,

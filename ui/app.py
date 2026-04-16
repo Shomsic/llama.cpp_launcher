@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import subprocess
+import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from tkinter import BOTH, LEFT, RIGHT, TOP, BOTTOM, HORIZONTAL, VERTICAL, W, E, N, S, X, Y, END, NORMAL, DISABLED, SUNKEN, SOLID, EXTENDED
@@ -16,6 +17,7 @@ import webbrowser
 import shlex
 import socket
 import copy
+from queue import Queue
 
 try:
     import ttkbootstrap as ttkb
@@ -29,11 +31,14 @@ from core.config import PRESETS, LOG_DIR, SETTINGS_FILE, DEFAULT_SETTINGS, ensur
 from core.hardware import get_gpu_info, get_gpu_name
 from core.gguf_parser import GGUFMetadataParser, extract_quant_from_filename, get_quant_description, get_quant_from_metadata
 from core.server_manager import LlamaServerManager
+from core.flag_builder import FlagBuilder, ServerConfig
 from core.estimator import ProfilingData, estimate_memory_breakdown, estimate_tokens_per_second as _est_tps
-
+from core.ai_tuner import AITuner
 from ui.components.tooltip import TooltipManager
+
 from ui.components.toast import ToastManager
 from ui.components.gpu_card import GpuCard
+from ui.components.selectable_label import SelectableLabel
 from ui.components.parameters_panel import PresetPanel, BasicParamsPanel, GenerationParamsPanel, AdvancedParamsPanel
 from ui.tabs.benchmark_tab import BenchmarkTab
 
@@ -46,6 +51,9 @@ class LlamaLauncherApp:
         self.state = state
         state.init_tk_vars(root)
         self.settings = state.settings
+        
+        self.log_queue = Queue()
+        self._schedule_log_flush()
 
         self.root.title(_("app_title"))
         geom = self.settings.get("window_geometry", "1000x700")
@@ -62,10 +70,12 @@ class LlamaLauncherApp:
         self.root.bind("<Control-r>", lambda e: self.refresh_models())
         self.root.bind("<F5>", lambda e: self.refresh_models())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind_all("<Control-c>", self._global_copy)
 
         # Стили и UI
         self._setup_styles()
         self.toast = ToastManager(root)
+        self.tuner = AITuner(state, self)
         self._create_ui()
 
         # Подписка на обновления state
@@ -134,7 +144,7 @@ class LlamaLauncherApp:
         # Вкладка теста
         bench_frame = ttk.Frame(self.notebook)
         self.notebook.add(bench_frame, text=_("tab_benchmark"))
-        self.benchmark_tab = BenchmarkTab(bench_frame, self.state, self.toast)
+        self.benchmark_tab = BenchmarkTab(bench_frame, self.state, self.toast, self)
 
         # Статус-бар
         self._create_status_bar()
@@ -161,13 +171,13 @@ class LlamaLauncherApp:
         self.gpu_card = GpuCard(right_frame, self.state)
 
         # Левая панель — секции
-        self._create_llama_dir_section(left_frame)
+        self._create_model_selection_section(left_frame)
         self.preset_panel = PresetPanel(left_frame, self.state, self.toast)
         self.tooltip = TooltipManager(self.root)
         self.basic_panel = BasicParamsPanel(left_frame, self.state, self.tooltip)
         self.generation_panel = GenerationParamsPanel(left_frame, self.state, self.tooltip)
         self.advanced_panel = AdvancedParamsPanel(left_frame, self.state, self.tooltip)
-        self._create_model_selection_section(left_frame)
+        self._create_llama_dir_section(left_frame)
 
         # Лог — справа снизу
         self._create_log_section(right_frame)
@@ -243,7 +253,7 @@ class LlamaLauncherApp:
 
         ttk.Button(row, text=_("btn_browse"), command=self.browse_llama_dir, width=12).pack(side=LEFT)
 
-        self.llama_status_label = ttk.Label(section, text="", font=("Segoe UI", 9))
+        self.llama_status_label = SelectableLabel(section, text="", font=("Segoe UI", 9))
         self.llama_status_label.pack(fill=X, pady=(5, 0))
 
         if self.settings.get("llama_dir"):
@@ -258,21 +268,29 @@ class LlamaLauncherApp:
         self.active_model_path_var = self.state.active_model_path_var
         self.active_model_meta_var = self.state.active_model_meta_var
 
-        self.active_model_label = ttk.Label(section, textvariable=self.active_model_name_var,
-                                             font=("Segoe UI", 10, "bold"))
+        self.active_model_label = SelectableLabel(section, text=self.active_model_name_var.get(),
+                                                      font=("Segoe UI", 10, "bold"))
         self.active_model_label.pack(anchor=W)
+        
+        # Связываем переменную с текстом SelectableLabel
+        self.state.active_model_name_var.trace_add("write", 
+            lambda *args: self.active_model_label.config(text=self.state.active_model_name_var.get()))
 
-        self.active_model_path_label = ttk.Label(
-            section, textvariable=self.active_model_path_var,
+        self.active_model_path_label = SelectableLabel(
+            section, text=self.active_model_path_var.get(),
             font=("Segoe UI", 8), foreground="#90caf9", wraplength=520, justify=LEFT
         )
         self.active_model_path_label.pack(fill=X, pady=(3, 0))
+        self.state.active_model_path_var.trace_add("write", 
+            lambda *args: self.active_model_path_label.config(text=self.state.active_model_path_var.get()))
 
-        self.active_model_meta_label = ttk.Label(
-            section, textvariable=self.active_model_meta_var,
+        self.active_model_meta_label = SelectableLabel(
+            section, text=self.active_model_meta_var.get(),
             font=("Segoe UI", 8), foreground="#b0bec5", wraplength=520, justify=LEFT
         )
         self.active_model_meta_label.pack(fill=X, pady=(4, 0))
+        self.state.active_model_meta_var.trace_add("write", 
+            lambda *args: self.active_model_meta_label.config(text=self.state.active_model_meta_var.get()))
 
         # Черновая модель
         self._create_draft_model_section(section)
@@ -303,9 +321,9 @@ class LlamaLauncherApp:
         section.pack(fill=BOTH, expand=True)
 
         self.log_text = scrolledtext.ScrolledText(section, width=50, height=30,
-                                                   font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+                                                    font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
         self.log_text.pack(fill=BOTH, expand=True)
-        self.log_text.config(state=NORMAL)
+        self.log_text.config(state=DISABLED)
         self.log_text.bind("<Button-3>", self.show_context_menu)
 
         btn_frame = ttk.Frame(section)
@@ -337,126 +355,86 @@ class LlamaLauncherApp:
         self.status_indicator.pack(side=RIGHT, padx=(10, 0))
         self.status_dot = self.status_indicator.create_oval(2, 2, 14, 14, fill="#666666", outline="")
 
-    def _create_status_bar(self):
-        status = ttk.Frame(self.root, relief=SUNKEN, borderwidth=1)
-        status.pack(fill=X, side=BOTTOM)
+    def run_ai_tune_ui(self):
+        """UI wrapper for AI Tuning process."""
+        # We need the current active model
+        model_path = self.state.active_model_var.get().strip()
+        if not model_path:
+            self.toast.show("⚠️ Пожалуйста, выберите модель для тюнинга")
+            return
+        if not os.path.isfile(model_path):
+            self.toast.show("⚠️ Файл модели не найден")
+            return
+        
+        # We need the BenchmarkTab to show progress
+        if not hasattr(self, 'benchmark_tab'):
+            self.toast.show("⚠️ Ошибка: вкладка теста не инициализирована")
+            return
 
-        self.status_label = ttk.Label(status, text=_("status_ready"), relief=SUNKEN)
-        self.status_label.pack(side=LEFT, padx=5, pady=2)
+        # Disable buttons during tune
+        self.start_btn.config(state=DISABLED)
+        if hasattr(self, 'ai_tune_btn'):
+            self.ai_tune_btn.config(state=DISABLED)
 
-        self.url_label = ttk.Label(status, text="", foreground="#90caf9")
-        self.url_label.pack(side=RIGHT, padx=5, pady=2)
+        def worker():
+            try:
+                # Tuning loop
+                # Note: tuner.tune is a blocking call
+                best_config, best_tps = self.tuner.tune(
+                    model_path,
+                    on_progress=lambda msg: self.root.after(0, lambda: self.benchmark_tab._append_log(msg))
+                )
+                
+                if best_config:
+                    # Save as a preset
+                    model_name = os.path.basename(model_path).split(".gguf")[0]
+                    preset_name = f"✨ {model_name} (AI-Optimized) {best_tps:.2f} tok/s"
+                    
+                    preset_data = {
+                        "ctx": best_config.ctx_size,
+                        "batch_size": best_config.batch_size,
+                        "flash_attn": best_config.flash_attn,
+                        "temp": best_config.temp,
+                        "top_k": best_config.top_k,
+                        "top_p": best_config.top_p,
+                        "min_p": best_config.min_p,
+                        "repeat_penalty": best_config.repeat_penalty,
+                        "presence_penalty": best_config.presence_penalty,
+                        "frequency_penalty": best_config.frequency_penalty,
+                        "mirostat": best_config.mirostat,
+                        "n_predict": best_config.n_predict,
+                    }
+                    
+                    custom_presets = self.settings.setdefault("custom_presets", {})
+                    custom_presets[preset_name] = preset_data
+                    self.state.save_settings()
+                    
+                    self.root.after(0, lambda: self.toast.show(f"✅ Пресет {preset_name} сохранен"))
+                else:
+                    self.root.after(0, lambda: self.toast.show("⚠️ Тюнинг завершен без улучшений"))
+                    
+            except Exception as e:
+                traceback.print_exc()
+                self.root.after(0, lambda: self.toast.show(f"❌ Ошибка тюнинга: {e}"))
+            finally:
+                # Re-enable buttons
+                self.root.after(0, self._enable_tune_buttons)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _enable_tune_buttons(self):
+        self.start_btn.config(state=NORMAL)
+        if hasattr(self, 'ai_tune_btn'):
+            self.ai_tune_btn.config(state=NORMAL)
+
 
     # ───────────── Вкладка моделей ─────────────
 
     def _create_models_tab(self, frame):
-        main_container = ttk.Frame(frame)
-        main_container.pack(fill=BOTH, expand=True, padx=15, pady=15)
+        from ui.tabs.models_tab import ModelsTab
+        self.models_tab = ModelsTab(self.root, self.state, self.notebook, self)
+        self.models_tab.create(frame)
 
-        left_panel = ttk.Frame(main_container)
-        left_panel.pack(side=LEFT, fill=BOTH, expand=False, padx=(0, 10))
-        left_panel.config(width=300)
-
-        right_panel = ttk.Frame(main_container)
-        right_panel.pack(side=RIGHT, fill=BOTH, expand=True)
-
-        # Список моделей
-        list_section = ttk.LabelFrame(left_panel, text=_("models_list_title"), padding=10)
-        list_section.pack(fill=BOTH, expand=True)
-
-        ttk.Label(list_section, text=_("models_label")).pack(anchor=W, pady=(0, 5))
-
-        scroll_y = ttk.Scrollbar(list_section, orient=VERTICAL)
-        scroll_y.pack(side=RIGHT, fill=Y)
-
-        self.models_listbox = tk.Listbox(list_section, selectmode=EXTENDED, yscrollcommand=scroll_y.set,
-                                          font=("Segoe UI", 9))
-        self.models_listbox.pack(fill=BOTH, expand=True)
-        scroll_y.config(command=self.models_listbox.yview)
-
-        self.models_listbox.bind("<<ListboxSelect>>", self._on_model_selected)
-        self.models_listbox.bind("<Double-Button-1>", lambda e: self.select_model_from_list())
-
-        btn_frame = ttk.Frame(list_section)
-        btn_frame.pack(fill=X, pady=(10, 0))
-
-        ttk.Button(btn_frame, text=_("btn_add_cat"), command=self.add_model_dir).pack(side=LEFT, padx=(0, 3))
-        ttk.Button(btn_frame, text=_("btn_add_file_plus"), command=self.add_model_files).pack(side=LEFT, padx=(0, 3))
-        ttk.Button(btn_frame, text=_("btn_remove_model"), command=self.remove_models).pack(side=LEFT, padx=(0, 3))
-        ttk.Button(btn_frame, text=_("btn_remove_cat"), command=self.remove_model_dir).pack(side=LEFT)
-
-        action_frame = ttk.Frame(list_section)
-        action_frame.pack(fill=X, pady=(10, 0))
-
-        ttk.Button(action_frame, text=_("btn_active"), command=self.set_active_model).pack(side=LEFT, padx=(0, 5))
-        ttk.Button(action_frame, text=_("btn_draft"), command=self.set_draft_model).pack(side=LEFT, padx=(0, 5))
-        ttk.Button(action_frame, text=_("btn_refresh"), command=self.refresh_models).pack(side=LEFT)
-
-        self.selected_model_hint_var = tk.StringVar(value=_("model_path_hint"))
-        self.selected_model_hint = ttk.Label(
-            list_section, textvariable=self.selected_model_hint_var,
-            font=("Segoe UI", 8), foreground="#b0bec5", wraplength=280, justify=LEFT
-        )
-        self.selected_model_hint.pack(fill=X, pady=(10, 0))
-
-        self.models_info_label = ttk.Label(list_section, text="", font=("Segoe UI", 8),
-                                           foreground="#90caf9")
-        self.models_info_label.pack(fill=X, pady=(6, 0))
-
-        # Метаданные
-        self._create_gguf_metadata_panel(right_panel)
-
-    def _create_gguf_metadata_panel(self, parent):
-        section = ttk.LabelFrame(parent, text=_("meta_panel"), padding=10)
-        section.pack(fill=BOTH, expand=True)
-
-        self.meta_header = ttk.Label(section, text=_("select_model_list"),
-                                      font=("Segoe UI", 12, "bold"))
-        self.meta_header.pack(fill=X, pady=(0, 10))
-
-        info_frame = ttk.Frame(section)
-        info_frame.pack(fill=X, pady=(0, 10))
-
-        self.meta_arch_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_arch_label.grid(row=0, column=0, sticky=W, padx=(0, 15), pady=2)
-
-        self.meta_params_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_params_label.grid(row=0, column=1, sticky=W, padx=(0, 15), pady=2)
-
-        self.meta_quant_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_quant_label.grid(row=0, column=2, sticky=W, pady=2)
-        self.meta_quant_desc = ttk.Label(info_frame, text="", font=("Segoe UI", 8), foreground="#5d7488")
-        self.meta_quant_desc.grid(row=1, column=2, sticky=W, pady=(0, 2))
-
-        self.meta_context_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_context_label.grid(row=2, column=0, sticky=W, padx=(0, 15), pady=2)
-
-        self.meta_layers_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_layers_label.grid(row=2, column=1, sticky=W, padx=(0, 15), pady=2)
-
-        self.meta_embedding_label = ttk.Label(info_frame, text="", font=("Segoe UI", 10))
-        self.meta_embedding_label.grid(row=2, column=2, sticky=W, pady=2)
-
-        ttk.Separator(section, orient=HORIZONTAL).pack(fill=X, pady=(5, 10))
-
-        tree_frame = ttk.Frame(section)
-        tree_frame.pack(fill=BOTH, expand=True)
-
-        tree_scroll = ttk.Scrollbar(tree_frame)
-        tree_scroll.pack(side=RIGHT, fill=Y)
-
-        self.meta_tree = ttk.Treeview(tree_frame, yscrollcommand=tree_scroll.set,
-                                       columns=("Value",), show="tree headings", selectmode="none")
-        self.meta_tree.pack(fill=BOTH, expand=True)
-        tree_scroll.config(command=self.meta_tree.yview)
-
-        self.meta_tree.heading("#0", text=_("tree_param"))
-        self.meta_tree.heading("Value", text=_("tree_value"))
-        self.meta_tree.column("#0", width=280)
-        self.meta_tree.column("Value", width=340)
-
-        self.meta_tree.tag_configure("important", foreground="#4caf50")
-        self.meta_tree.tag_configure("warning", foreground="#ff9800")
 
     # ───────────── Вкладка настроек ─────────────
 
@@ -503,65 +481,31 @@ class LlamaLauncherApp:
     # ───────────── Методы моделей ─────────────
 
     def refresh_models(self):
-        """Асинхронно загружает список моделей, не блокируя UI."""
-        if not hasattr(self, 'models_listbox'):
-            return
-
-        # Показываем индикатор загрузки
-        self.models_listbox.delete(0, END)
-        self.models_listbox.insert(END, _("loading"))
-        self.models_info_label.config(text=_("loading"))
-
-        thread = threading.Thread(target=self._refresh_models_thread, daemon=True)
-        thread.start()
-
-    def _refresh_models_thread(self):
-        """Фоновый поток для сканирования моделей."""
-        try:
-            models = self.state.get_all_models()
-            if self.root.winfo_exists():
-                self.root.after(0, self._refresh_models_ui, models)
-        except Exception as e:
-            if self.root.winfo_exists():
-                self.root.after(0, lambda: self.models_info_label.config(text=f"Error: {e}"))
-
-    def _refresh_models_ui(self, models):
-        """Обновляет UI со списком моделей (вызывается из основного потока)."""
-        if not hasattr(self, 'models_listbox'):
-            return
-
-        self.models_listbox.delete(0, END)
-        for model_path in models:
-            name = os.path.basename(model_path)
-            self.models_listbox.insert(END, name)
-        self._models_paths = models
-
-        count = len(models)
-        self.models_info_label.config(text=_("found_models").format(count))
+        """Обновляет список моделей через вкладку моделей."""
+        if hasattr(self, 'models_tab'):
+            self.models_tab.refresh_models()
 
     def _on_model_selected(self, event=None):
-        selection = self.models_listbox.curselection()
+        selection = self.models_tree.selection()
         if not selection:
             self.selected_model_hint_var.set(_("model_path_hint"))
             return
 
-        models = getattr(self, '_models_paths', [])
-        idx = selection[0]
-        if idx >= len(models):
-            return
-
-        model_path = models[idx]
-        self.selected_model_hint_var.set(model_path)
-        self._load_gguf_metadata(model_path)
+        item = selection[0]
+        values = self.models_tree.item(item, "values")
+        model_path = values[0] if values else self.models_tree.item(item, "text")
+        if model_path and hasattr(self, '_load_gguf_metadata'):
+            self._load_gguf_metadata(model_path)
 
     def select_model_from_list(self):
-        selection = self.models_listbox.curselection()
+        selection = self.models_tree.selection()
         if not selection:
             return
-        models = getattr(self, '_models_paths', [])
-        idx = selection[0]
-        if idx < len(models):
-            self._set_active_model(models[idx])
+        item = selection[0]
+        values = self.models_tree.item(item, "values")
+        model_path = values[0] if values else self.models_tree.item(item, "text")
+        if model_path:
+            self._set_active_model(model_path)
 
     def add_model_dir(self):
         folder = filedialog.askdirectory(title=_("add_folder_title"))
@@ -586,15 +530,17 @@ class LlamaLauncherApp:
             self.refresh_models()
 
     def remove_models(self):
-        selection = self.models_listbox.curselection()
+        selection = self.models_tree.selection()
         if not selection:
             return
-        models = getattr(self, '_models_paths', [])
+        
         if messagebox.askyesno(_("remove_confirm_title"), _("remove_confirm_msg")):
-            to_remove = set()
-            for idx in selection:
-                if idx < len(models):
-                    to_remove.add(models[idx])
+            to_remove = []
+            for item in selection:
+                values = self.models_tree.item(item, "values")
+                path = values[0] if values else self.models_tree.item(item, "text")
+                to_remove.append(path)
+                
             file_list = self.settings.get("model_files", [])
             self.settings["model_files"] = [f for f in file_list if f not in to_remove]
             self.state.save_settings()
@@ -660,7 +606,8 @@ class LlamaLauncherApp:
         self.state.active_model_var.set(model_path)
         if model_path and os.path.isfile(model_path):
             self.state.recalculate_limits(model_path)
-            self._load_gguf_metadata(model_path)
+            if hasattr(self, 'models_tab'):
+                self.models_tab._load_gguf_metadata(model_path)
         self._sync_active_model_ui()
         self._update_memory_estimate()
         self._update_gpu_info_card()
@@ -942,96 +889,147 @@ class LlamaLauncherApp:
         self.root.clipboard_append(cmd_str)
         self.toast.show("📋 Команда скопирована!")
 
-    def _build_command(self):
-        """Строит полную команду запуска."""
+    def _build_command(self, backend=None):
+        """Строит полную команду запуска с использованием FlagBuilder.
+        backend: forced backend ('llama' or 'ik_llama'), otherwise uses state.
+        """
         server_exe = self.state.get_server_exe_path()
         if not server_exe:
             return []
-
         model_path = self.state.active_model_var.get()
-        is_server = os.path.basename(server_exe).lower() == "llama-server.exe"
-
+        if not model_path:
+            return []
+        
+        # Создаем конфиг из состояния UI
         s = self.state
-        cmd = [
-            server_exe,
-            "-m", model_path or "model.gguf",
-        ]
-
-        draft_path = s.draft_model_var.get()
-        if draft_path and os.path.exists(draft_path):
-            cmd.extend(["-md", draft_path])
-            cmd.extend(["-ngld", str(s.draft_ngl_var.get())])
-
-        cmd.extend([
-            "-c", str(s.ctx_var.get()),
-            "-t", str(s.threads_var.get()),
-            "-np", str(s.parallel_slots_var.get()),
-            "-ngl", str(s.ngl_var.get()),
-            "-b", str(s.batch_size_var.get()),
-            "--temp", str(s.temp_var.get()),
-            "--top-k", str(s.top_k_var.get()),
-            "--top-p", str(s.top_p_var.get()),
-            "--min-p", str(s.min_p_var.get()),
-            "--repeat-penalty", str(s.repeat_penalty_var.get()),
-            "--presence-penalty", str(s.presence_penalty_var.get()),
-            "--frequency-penalty", str(s.frequency_penalty_var.get()),
-            "--mirostat", str(s.mirostat_var.get()),
-            "-n", str(s.n_predict_var.get()),
-            "--seed", str(s.seed_var.get()),
-        ])
-
-        flash_val = s.flash_attn_var.get()
-        if flash_val in ("on", "off", "auto"):
-            cmd.extend(["--flash-attn", flash_val])
-
-        if s.mmap_var.get() == "off":
-            cmd.append("--no-mmap")
-        if s.mlock_var.get() == "on":
-            cmd.append("--mlock")
-        if s.kv_offload_var.get() == "off":
-            cmd.append("--no-kv-offload")
-        if s.cache_prompt_var.get() == "off":
-            cmd.append("--no-cache-prompt")
-
-        if s.reasoning_var.get() in ("on", "off"):
-            cmd.extend(["--reasoning", s.reasoning_var.get()])
-
-        rope_scale = s.rope_scale_var.get().strip()
-        if rope_scale and rope_scale.lower() != "auto":
-            cmd.extend(["--rope-scale", rope_scale])
-
-        rope_freq = s.rope_freq_base_var.get().strip()
-        if rope_freq and rope_freq.lower() != "auto":
-            cmd.extend(["--rope-freq-base", rope_freq])
-
-        if is_server:
+        config = ServerConfig(
+            model_path=model_path,
+            port=s.port_var.get(),
+            ctx_size=s.ctx_var.get(),
+            kv_quality="high" if s.kv_quality_var.get() == "high" else "mid" if s.kv_quality_var.get() == "mid" else "low",
+            ram_budget_mb=0,
+            backend=backend if backend else (s.backend_var.get() if hasattr(s, 'backend_var') else "auto"),
+            keep_alive=s.keep_alive_var.get() if hasattr(s, 'keep_alive_var') else False,
+            mmproj_path=s.mmproj_var.get(),
+            temp=s.temp_var.get(),
+            top_k=s.top_k_var.get(),
+            top_p=s.top_p_var.get(),
+            min_p=s.min_p_var.get(),
+            repeat_penalty=s.repeat_penalty_var.get(),
+            presence_penalty=s.presence_penalty_var.get(),
+            frequency_penalty=s.frequency_penalty_var.get(),
+            mirostat=s.mirostat_var.get(),
+            n_predict=s.n_predict_var.get(),
+            seed=s.seed_var.get(),
+            parallel_slots=s.parallel_slots_var.get(),
+            threads=s.threads_var.get(),
+            batch_size=s.batch_size_var.get(),
+            flash_attn=s.flash_attn_var.get(),
+            mmap=s.mmap_var.get(),
+            mlock=s.mlock_var.get(),
+            kv_offload=s.kv_offload_var.get(),
+            cache_prompt=s.cache_prompt_var.get(),
+            reasoning=s.reasoning_var.get(),
+            rope_scale=s.rope_scale_var.get(),
+            rope_freq_base=s.rope_freq_base_var.get(),
+            draft_model_path=s.draft_model_var.get(),
+            draft_ngl=s.draft_ngl_var.get(),
+            custom_args=s.custom_args_var.get()
+        )
+        
+        builder = FlagBuilder(self.state)
+        config = builder.build(config)
+        
+        # Apply cached AI‑tuned flag overrides if available
+        if hasattr(self, 'tuner'):
+            applied = self.tuner.apply_cached_tune(config)
+            if applied:
+                # Optional: log that cached tuning is being used
+                pass
+        
+        cmd = [config.binary_path] + config.flags
+        
+        if os.path.basename(config.binary_path).lower() == "llama-server.exe":
             host_val = s.host_var.get().strip() or "127.0.0.1"
-            cmd.extend(["--host", host_val, "--port", str(s.port_var.get())])
-
+            cmd.extend(["--host", host_val])
             api_key = s.api_key_var.get().strip()
             if api_key:
                 cmd.extend(["--api-key", api_key])
-
             if s.webui_var.get() == "off":
                 cmd.append("--no-webui")
         else:
             cmd.append("-i")
-
-        custom_args = s.custom_args_var.get().strip()
-        if custom_args:
-            if sys.platform == "win32":
-                args = shlex.split(custom_args, posix=False)
-                args = [arg[1:-1] if len(arg) >= 2 and arg[0] in ('"', "'") and arg[-1] == arg[0] else arg for arg in args]
-                cmd.extend(args)
-            else:
-                cmd.extend(shlex.split(custom_args, posix=True))
-
         return cmd
+
 
     def open_logs_folder(self):
         ensure_log_dir()
         os.startfile(str(LOG_DIR))
         self.toast.show("📂 Папка логов открыта")
+
+    def run_ai_tune(self, bench_tab, rounds=None, retune=None):
+        model_path = bench_tab.bench_model_var.get()
+        if not model_path:
+            self.toast.show("⚠️ Модель не выбрана")
+            return
+        
+        # Determine rounds and retune values
+        if rounds is None and hasattr(bench_tab, 'ai_tune_rounds_var'):
+            rounds = bench_tab.ai_tune_rounds_var.get()
+        if retune is None and hasattr(bench_tab, 'ai_tune_retune_var'):
+            retune = bench_tab.ai_tune_retune_var.get()
+        rounds = rounds or 8
+        retune = retune or False
+        
+        bench_tab.results_text.delete(1.0, END)
+        bench_tab.results_text.insert(END, f"🪄 Запуск AI-Tuning (rounds={rounds}, retune={retune})...\n\n")
+        self.toast.show("🪄 AI-Tuning запущен. Результаты во вкладке Тест")
+        
+        def worker():
+            try:
+                best_config, best_tps = self.tuner.tune(
+                    model_path, 
+                    rounds=rounds,
+                    retune=retune,
+                    on_progress=lambda msg: self.root.after(0, lambda: bench_tab._append_log(msg))
+                )
+                
+                if best_config is None:
+                    self.root.after(0, lambda: bench_tab._append_log("\n❌ Тюнинг не удалось завершить (не найден подходящий конфиг)."))
+                    return
+                
+                # Сохраняем лучший результат в пресеты
+                model_name = os.path.basename(model_path).split(".gguf")[0]
+                preset_name = f"✨ {model_name} (AI-Optimized) {best_tps:.2f} tok/s"
+                
+                # Создаем словарь настроек из config
+                preset_data = {
+                    "ctx": best_config.ctx_size,
+                    "batch_size": best_config.batch_size,
+                    "flash_attn": best_config.flash_attn,
+                    "temp": best_config.temp,
+                    "top_k": best_config.top_k,
+                    "top_p": best_config.top_p,
+                    "min_p": best_config.min_p,
+                    "repeat_penalty": best_config.repeat_penalty,
+                    "presence_penalty": best_config.presence_penalty,
+                    "frequency_penalty": best_config.frequency_penalty,
+                    "mirostat": best_config.mirostat,
+                    "n_predict": best_config.n_predict,
+                }
+                
+                custom_presets = self.settings.setdefault("custom_presets", {})
+                custom_presets[preset_name] = preset_data
+                self.state.save_settings()
+                
+                self.root.after(0, lambda: bench_tab._append_log(f"\n\n✅ Тюнинг завершен!\nЛучший результат: {best_tps:.2f} tok/s\nПресет сохранен как: {preset_name}"))
+                self.root.after(0, lambda: self.toast.show(f"✅ Пресет {preset_name} сохранен"))
+            except Exception as e:
+                traceback.print_exc()
+                self.root.after(0, lambda e=e: bench_tab._append_log(f"\n❌ Ошибка тюнинга: {e}"))
+                self.root.after(0, lambda e=e: self.toast.show(f"❌ Ошибка тюнинга: {e}"))
+        
+        threading.Thread(target=worker, daemon=True).start()
 
     # ───────────── Сервер ─────────────
 
@@ -1040,32 +1038,36 @@ class LlamaLauncherApp:
         if not valid:
             messagebox.showerror("Ошибка", msg)
             return
-
+        
         model_path = self.state.active_model_var.get()
         if not model_path:
             messagebox.showerror("Ошибка", "Модель не выбрана")
             return
-
         if not os.path.isfile(model_path):
             messagebox.showerror("Ошибка", "Файл модели не найден")
             return
-
+        
+        # Основная команда
         cmd = self._build_command()
         if not cmd:
             messagebox.showerror("Ошибка", "Не удалось собрать команду")
             return
-
+        
+        # Fallback команда (стандартный llama-server)
+        fallback_cmd = self._build_command(backend="llama")
+        
         server_mgr = LlamaServerManager()
-
+        
         def on_log(line):
             self.root.after(0, self._append_log, line)
-
+        
         def on_stop():
             self.root.after(0, self._on_server_stopped)
-
+        
         ok, err = server_mgr.start(cmd, cwd=self.state.llama_dir_var.get(),
-                                    on_log=on_log, on_stop=on_stop)
-
+                                     on_log=on_log, on_stop=on_stop,
+                                     fallback_args=fallback_cmd if fallback_cmd != cmd else None)
+        
         if ok:
             self.state.running = True
             self.state.server_manager = server_mgr  # сохраняем менеджер
@@ -1080,17 +1082,18 @@ class LlamaLauncherApp:
         else:
             messagebox.showerror("Ошибка", err)
 
+
     def stop_server(self):
         if not self.state.running:
             return
         self.state.stopping = True
-
+        
         # Используем серверный менеджер для корректной остановки
         server_mgr = getattr(self.state, 'server_manager', None)
         if server_mgr:
             server_mgr.stop()
         elif self.state.server_process:
-            # Fallback: прямая остановка, если менеджер не сохранён
+            # Fallback: прямая остановка
             try:
                 self.state.server_process.terminate()
                 try:
@@ -1100,18 +1103,32 @@ class LlamaLauncherApp:
                     self.state.server_process.wait(timeout=1)
             except Exception as e:
                 self._append_log(f"[Ошибка остановки: {e}]")
+            
+            # Закрываем потоки чтения, если они остались
+            if hasattr(self.state, 'server_manager'):
+                self.state.server_manager._cleanup_process()
+            
             self._on_server_stopped()
 
+    def _schedule_log_flush(self):
+        """Периодически сбрасывает очередь логов в UI, чтобы не перегружать event loop."""
+        try:
+            while not self.log_queue.empty():
+                line = self.log_queue.get_nowait()
+                self._append_log_threadsafe(line)
+        except Exception:
+            pass
+        self.root.after(100, self._schedule_log_flush)
+
     def _append_log(self, line):
-        if self.root.winfo_exists():
-            self.root.after(0, self._append_log_threadsafe, line)
+        self.log_queue.put(line)
 
     def _append_log_threadsafe(self, line):
         if self.log_text and self.root.winfo_exists():
             self.log_text.config(state=NORMAL)
             self.log_text.insert(END, line + "\n")
             self.log_text.see(END)
-            self.log_text.config(state=NORMAL)
+            self.log_text.config(state=DISABLED)
 
     def _on_server_stopped(self):
         if self.root.winfo_exists():
@@ -1162,6 +1179,16 @@ class LlamaLauncherApp:
         menu.post(event.x_root, event.y_root)
 
     # ───────────── Обновления ─────────────
+
+    def _create_status_bar(self):
+        status = ttk.Frame(self.root, relief=SUNKEN, borderwidth=1)
+        status.pack(fill=X, side=BOTTOM)
+        
+        self.status_label = SelectableLabel(status, text=_("status_ready"), relief=SUNKEN)
+        self.status_label.pack(side=LEFT, padx=5, pady=2)
+        
+        self.url_label = SelectableLabel(status, text="", foreground="#90caf9")
+        self.url_label.pack(side=RIGHT, padx=5, pady=2)
 
     def _refresh_startup_state(self):
         self.refresh_models()
@@ -1248,3 +1275,36 @@ class LlamaLauncherApp:
         self.save_geometry()
         self.state.save_settings()
         self.root.destroy()
+
+    def _global_copy(self, event):
+        """Позволяет копировать текст любого виджета под курсором через Ctrl+C."""
+        focused = self.root.focus_get()
+        # Если текущий фокус на поле ввода и там есть выделение — позволяем стандартное копирование
+        if focused:
+            try:
+                if hasattr(focused, 'selection_get') and focused.selection_get():
+                    return
+            except:
+                pass
+
+        # Иначе пытаемся скопировать текст виджета, который находится под мышью
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget:
+            text = None
+            try:
+                # Пробуем достать текст через cget (для Label)
+                text = widget.cget('text')
+            except:
+                try:
+                    # Пробуем через get (для Entry/Text)
+                    text = widget.get()
+                except:
+                    pass
+            
+            if text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(str(text))
+                # Показываем уведомление, если текст не слишком длинный
+                display_text = (text[:50] + '...') if len(str(text)) > 50 else text
+                self.show_toast(f"Скопировано: {display_text}")
+                return "break"
